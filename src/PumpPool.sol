@@ -25,13 +25,10 @@ contract PumpPool is ReentrancyGuard, Ownable {
     bool public sellingEnabled;
     uint256 public sellingEnableTimestamp;
     
-    // Fee constants
-    uint256 public constant FEE_PERCENTAGE = 5; // 0.5%
-    uint256 public constant FEE_DENOMINATOR = 1000;
-    
-    // Anti-bot protection
+    // Anti-bot mechanism
+    mapping(address => uint256) public lastBlockBought;
+    mapping(uint256 => uint256) public blockTransactionCount;
     uint256 public constant MAX_TX_PER_BLOCK = 3;
-    mapping(address => mapping(uint256 => uint256)) public txCounter;
     
     // Time constants
     uint256 public constant TWO_HOURS = 2 hours;
@@ -58,118 +55,130 @@ contract PumpPool is ReentrancyGuard, Ownable {
         
         // Calculate initial token amount using bonding curve
         uint256 totalSupply = IERC20(token).totalSupply();
-        uint256 initialTokenAmount = calculateInitialTokenAmount(msg.value, totalSupply);
         
-        // Transfer initial tokens from factory to this contract
-        IERC20(token).safeTransferFrom(msg.sender, address(this), initialTokenAmount);
+        // Here you'd define how much of the token supply should be in the pool
+        // For example: 80% of total supply
+        uint256 initialTokenAmount = (totalSupply * 80) / 100;
         
-        // Initialize reserves
+        // Transfer tokens from creator to pool
+        IERC20(_token).safeTransferFrom(creator, address(this), initialTokenAmount);
+        
+        // Update reserves
         ethReserves = msg.value;
         tokenReserves = initialTokenAmount;
-        
-        // Transfer ownership to the creator
-        _transferOwnership(creator);
     }
     
     /**
-     * @dev Allows users to buy tokens with ETH
+     * @dev Buys tokens with ETH
+     * @return tokenAmount Amount of tokens bought
      */
-    function buyTokens() external payable nonReentrant returns (uint256) {
+    function buyTokens() external payable nonReentrant returns (uint256 tokenAmount) {
         require(!tradingPaused, "Trading is paused");
-        require(msg.value > 0, "ETH amount must be greater than 0");
+        require(msg.value > 0, "Must send ETH");
         
-        // Check anti-bot protection
-        checkAntiBot();
+        // Anti-bot mechanism
+        require(blockTransactionCount[block.number] < MAX_TX_PER_BLOCK, "Max transactions per block reached");
+        blockTransactionCount[block.number] += 1;
+        lastBlockBought[msg.sender] = block.number;
         
-        // Calculate tokens to receive based on constant product formula
-        uint256 tokenAmount = calculateBuyAmount(msg.value);
+        // Calculate token amount using bonding curve
+        tokenAmount = calculateBuyAmount(msg.value);
+        require(tokenAmount > 0, "Token amount too small");
+        require(tokenAmount <= tokenReserves, "Not enough tokens in reserve");
         
-        // Calculate fee
-        uint256 feeAmount = tokenAmount * FEE_PERCENTAGE / FEE_DENOMINATOR;
-        uint256 tokenAmountAfterFee = tokenAmount - feeAmount;
+        // Calculate fee (e.g., 1% fee)
+        uint256 fee = (msg.value * 1) / 100;
+        uint256 ethForTokens = msg.value - fee;
         
         // Update reserves
         ethReserves += msg.value;
         tokenReserves -= tokenAmount;
         
         // Transfer tokens to buyer
-        IERC20(token).safeTransfer(msg.sender, tokenAmountAfterFee);
+        IERC20(token).safeTransfer(msg.sender, tokenAmount);
         
-        // Emit event
-        emit Buy(msg.sender, tokenAmountAfterFee, msg.value, feeAmount);
-        
-        return tokenAmountAfterFee;
+        emit Buy(msg.sender, tokenAmount, msg.value, fee);
+        return tokenAmount;
     }
     
     /**
-     * @dev Allows users to sell tokens for ETH
+     * @dev Sells tokens for ETH
+     * @param tokenAmount Amount of tokens to sell
+     * @return ethAmount Amount of ETH received
      */
-    function sellTokens(uint256 tokenAmount) external nonReentrant returns (uint256) {
+    function sellTokens(uint256 tokenAmount) external nonReentrant returns (uint256 ethAmount) {
         require(!tradingPaused, "Trading is paused");
-        require(tokenAmount > 0, "Token amount must be greater than 0");
+        require(sellingEnabled || block.timestamp >= sellingEnableTimestamp, "Selling is currently disabled");
+        require(tokenAmount > 0, "Must sell some tokens");
         
-        // Check if selling is enabled
-        if (!sellingEnabled) {
-            if (block.timestamp >= sellingEnableTimestamp) {
-                sellingEnabled = true;
-                emit SellingEnabled();
-            } else {
-                revert("Selling is currently disabled");
-            }
+        // Enable selling if timelock has passed
+        if (!sellingEnabled && block.timestamp >= sellingEnableTimestamp) {
+            sellingEnabled = true;
+            emit SellingEnabled();
         }
         
-        // Check anti-bot protection
-        checkAntiBot();
+        // Calculate ETH amount using bonding curve
+        ethAmount = calculateSellAmount(tokenAmount);
+        require(ethAmount > 0, "ETH amount too small");
+        require(ethAmount <= ethReserves, "Not enough ETH in reserve");
         
-        // Calculate ETH to receive based on constant product formula
-        uint256 ethAmount = calculateSellAmount(tokenAmount);
-        
-        // Calculate fee
-        uint256 feeAmount = ethAmount * FEE_PERCENTAGE / FEE_DENOMINATOR;
-        uint256 ethAmountAfterFee = ethAmount - feeAmount;
-        
-        // Check if contract has enough ETH
-        require(ethReserves >= ethAmountAfterFee, "Insufficient ETH liquidity");
+        // Calculate fee (e.g., 1% fee)
+        uint256 fee = (ethAmount * 1) / 100;
+        uint256 ethToSeller = ethAmount - fee;
         
         // Update reserves
-        ethReserves -= ethAmountAfterFee;
         tokenReserves += tokenAmount;
+        ethReserves -= ethAmount;
         
-        // Transfer tokens from seller to pool
+        // Transfer tokens from seller
         IERC20(token).safeTransferFrom(msg.sender, address(this), tokenAmount);
         
         // Transfer ETH to seller
-        (bool success, ) = payable(msg.sender).call{value: ethAmountAfterFee}("");
+        (bool success, ) = payable(msg.sender).call{value: ethToSeller}("");
         require(success, "ETH transfer failed");
         
-        // Emit event
-        emit Sell(msg.sender, tokenAmount, ethAmountAfterFee, feeAmount);
-        
-        return ethAmountAfterFee;
+        emit Sell(msg.sender, tokenAmount, ethAmount, fee);
+        return ethAmount;
     }
     
     /**
-     * @dev Returns the current token price in ETH (scaled by 1e18)
+     * @dev Calculates token amount to be received when buying with ETH
+     * @param ethAmount Amount of ETH to spend
+     * @return tokenAmount Amount of tokens to receive
      */
-    function getTokenPrice() external view returns (uint256) {
-        require(tokenReserves > 0, "No liquidity");
+    function calculateBuyAmount(uint256 ethAmount) public view returns (uint256 tokenAmount) {
+        // Simple bonding curve: y = k * x / (x + c)
+        // where k is a constant and c is a parameter that controls the curve shape
+        uint256 k = tokenReserves;
+        uint256 c = ethReserves;
         
-        // Price is ETH reserves / token reserves
-        return (ethReserves * 10**18) / tokenReserves;
+        return (k * ethAmount) / (c + ethAmount);
     }
     
     /**
-     * @dev Returns time until selling is enabled
+     * @dev Calculates ETH amount to be received when selling tokens
+     * @param tokenAmount Amount of tokens to sell
+     * @return ethAmount Amount of ETH to receive
      */
-    function timeUntilSellingEnabled() external view returns (uint256) {
-        if (sellingEnabled || block.timestamp >= sellingEnableTimestamp) {
-            return 0;
-        }
-        return sellingEnableTimestamp - block.timestamp;
+    function calculateSellAmount(uint256 tokenAmount) public view returns (uint256 ethAmount) {
+        // Reverse of the bonding curve for buying
+        uint256 k = tokenReserves;
+        uint256 c = ethReserves;
+        
+        return (c * tokenAmount) / (k + tokenAmount);
     }
     
     /**
-     * @dev Emergency: Pause all trading (owner only)
+     * @dev Returns the current token price in ETH
+     * @return price Token price in ETH (scaled by 1e18)
+     */
+    function getTokenPrice() external view returns (uint256 price) {
+        if (tokenReserves == 0) return 0;
+        return (ethReserves * 1e18) / tokenReserves;
+    }
+    
+    /**
+     * @dev Pauses trading in emergency situation
      */
     function pauseTrading() external onlyOwner {
         tradingPaused = true;
@@ -177,7 +186,7 @@ contract PumpPool is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @dev Emergency: Resume trading (owner only)
+     * @dev Resumes trading after pause
      */
     function resumeTrading() external onlyOwner {
         tradingPaused = false;
@@ -185,108 +194,25 @@ contract PumpPool is ReentrancyGuard, Ownable {
     }
     
     /**
-     * @dev Emergency: Withdraw liquidity (owner only)
+     * @dev Emergency withdraw of assets to owner
      */
     function emergencyWithdraw() external onlyOwner {
         uint256 ethAmount = ethReserves;
-        uint256 tokenAmount = tokenReserves;
+        uint256 tokenAmount = IERC20(token).balanceOf(address(this));
         
-        // Reset reserves
         ethReserves = 0;
         tokenReserves = 0;
         
         // Transfer ETH to owner
-        (bool success, ) = payable(msg.sender).call{value: ethAmount}("");
+        (bool success, ) = payable(owner()).call{value: ethAmount}("");
         require(success, "ETH transfer failed");
         
         // Transfer tokens to owner
-        IERC20(token).safeTransfer(msg.sender, tokenAmount);
+        IERC20(token).safeTransfer(owner(), tokenAmount);
         
-        // Revoke owner privileges after emergency withdrawal
-        renounceOwnership();
-        
-        // Emit event
-        emit EmergencyWithdraw(msg.sender, ethAmount, tokenAmount);
+        emit EmergencyWithdraw(owner(), ethAmount, tokenAmount);
     }
     
-    /**
-     * @dev Calculate initial token amount using exponential bonding curve (PumpFun style)
-     */
-    function calculateInitialTokenAmount(uint256 ethAmount, uint256 totalSupply) public pure returns (uint256) {
-        // Base price in ETH for the first token (scaled by 1e18)
-        uint256 basePrice = 10**15; // 0.001 ETH
-        
-        // For first purchase, simple calculation without exponential part
-        // tokens = ethAmount / basePrice
-        uint256 initialTokenAmount = (ethAmount * 10**18) / basePrice;
-        
-        // Cap at 25% of total supply for initial purchase
-        uint256 maxInitialPurchase = totalSupply / 4;
-        
-        if (initialTokenAmount > maxInitialPurchase) {
-            return maxInitialPurchase;
-        }
-        
-        return initialTokenAmount;
-    }
-    
-    /**
-     * @dev Calculate token amount for buying with ETH using constant product formula
-     */
-    function calculateBuyAmount(uint256 ethAmount) public view returns (uint256) {
-        require(ethReserves > 0 && tokenReserves > 0, "Insufficient liquidity");
-        
-        // x * y = k formula
-        // (ethReserves + ethAmount) * (tokenReserves - tokenAmount) = ethReserves * tokenReserves
-        
-        uint256 product = ethReserves * tokenReserves;
-        uint256 newEthReserves = ethReserves + ethAmount;
-        uint256 newTokenReserves = product / newEthReserves;
-        
-        uint256 tokenAmount = tokenReserves - newTokenReserves;
-        
-        require(tokenAmount < tokenReserves, "Invalid calculation");
-        
-        return tokenAmount;
-    }
-    
-    /**
-     * @dev Calculate ETH amount for selling tokens using constant product formula
-     */
-    function calculateSellAmount(uint256 tokenAmount) public view returns (uint256) {
-        require(ethReserves > 0 && tokenReserves > 0, "Insufficient liquidity");
-        
-        // x * y = k formula
-        // (ethReserves - ethAmount) * (tokenReserves + tokenAmount) = ethReserves * tokenReserves
-        
-        uint256 product = ethReserves * tokenReserves;
-        uint256 newTokenReserves = tokenReserves + tokenAmount;
-        uint256 newEthReserves = product / newTokenReserves;
-        
-        uint256 ethAmount = ethReserves - newEthReserves;
-        
-        require(ethAmount < ethReserves, "Invalid calculation");
-        
-        return ethAmount;
-    }
-    
-    /**
-     * @dev Check anti-bot protection
-     */
-    function checkAntiBot() internal {
-        address sender = msg.sender;
-        uint256 blockNumber = block.number;
-        
-        uint256 currentTxCount = txCounter[sender][blockNumber];
-        
-        require(currentTxCount < MAX_TX_PER_BLOCK, "Max transactions per block reached");
-        
-        // Increment tx counter
-        txCounter[sender][blockNumber] = currentTxCount + 1;
-    }
-    
-    /**
-     * @dev Receive function to allow contract to receive ETH
-     */
+    // Allow contract to receive ETH
     receive() external payable {}
 }
