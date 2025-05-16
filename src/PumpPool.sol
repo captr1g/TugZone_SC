@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.17;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/token/ERC20/IERC20.sol";
+import "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/access/Ownable.sol";
 
 /**
  * @title PumpPool
@@ -33,15 +33,32 @@ contract PumpPool is ReentrancyGuard, Ownable {
     // Time constants
     uint256 public constant TWO_HOURS = 2 hours;
     
+    // Vesting mechanism
+    uint256 public constant VESTING_PERIOD = 7 days;
+    uint256 public constant DAILY_UNLOCK_PERCENTAGE = 1429; // 14.29% with 2 decimal places (100% / 7)
+    mapping(address => uint256) public userInitialBalance;
+    mapping(address => uint256) public userVestingStart;
+    mapping(address => uint256) public userTotalSold;
+    
+    // Initial phase tracking
+    bool public initialPhaseCompleted = false;
+    
     // Events
     event Buy(address indexed buyer, uint256 tokenAmount, uint256 ethAmount, uint256 fee);
     event Sell(address indexed seller, uint256 tokenAmount, uint256 ethAmount, uint256 fee);
     event SellingEnabled();
     event EmergencyWithdraw(address indexed recipient, uint256 ethAmount, uint256 tokenAmount);
     event TradingPaused(bool paused);
+    event VestingInitialized(address indexed user, uint256 initialBalance, uint256 startTime);
+    event PoolInitialized(address indexed token, uint256 initialTokenAmount, uint256 initialEthAmount, uint256 initialPrice);
+    
+    constructor() Ownable(msg.sender) {
+        // Any initialization logic if needed
+    }
     
     /**
      * @dev Initializes the pool with token and initial liquidity from creator
+     * Places 1B tokens in the pool and determines price based on ETH provided
      */
     function initialize(address _token, address creator) external payable onlyOwner {
         require(token == address(0), "Already initialized");
@@ -53,12 +70,16 @@ contract PumpPool is ReentrancyGuard, Ownable {
         sellingEnabled = false;
         sellingEnableTimestamp = block.timestamp + TWO_HOURS;
         
-        // Calculate initial token amount using bonding curve
-        uint256 totalSupply = IERC20(token).totalSupply();
+        // Get token total supply
+        uint256 totalSupply = IERC20(_token).totalSupply();
         
-        // Here you'd define how much of the token supply should be in the pool
-        // For example: 80% of total supply
-        uint256 initialTokenAmount = (totalSupply * 80) / 100;
+        // For this example, we'll use 1 billion tokens (assuming 18 decimals)
+        uint256 initialTokenAmount = 1_000_000_000 * 10**18;
+        
+        // If the token's total supply is less than 1B, use the total supply
+        if (totalSupply < initialTokenAmount) {
+            initialTokenAmount = totalSupply;
+        }
         
         // Transfer tokens from creator to pool
         IERC20(_token).safeTransferFrom(creator, address(this), initialTokenAmount);
@@ -66,6 +87,15 @@ contract PumpPool is ReentrancyGuard, Ownable {
         // Update reserves
         ethReserves = msg.value;
         tokenReserves = initialTokenAmount;
+        
+        // The initial price is determined by: ETH reserves / token reserves
+        // This yields price per whole token (not accounting for decimals)
+        // Initial price = msg.value / 1B tokens
+        
+        // This can be queried via getTokenPrice() which returns:
+        // (ethReserves * 1e18) / tokenReserves
+        
+        emit PoolInitialized(_token, initialTokenAmount, msg.value, (msg.value * 1e18) / initialTokenAmount);
     }
     
     /**
@@ -81,7 +111,7 @@ contract PumpPool is ReentrancyGuard, Ownable {
         blockTransactionCount[block.number] += 1;
         lastBlockBought[msg.sender] = block.number;
         
-        // Calculate token amount using bonding curve
+        // Calculate token amount using AMM formula
         tokenAmount = calculateBuyAmount(msg.value);
         require(tokenAmount > 0, "Token amount too small");
         require(tokenAmount <= tokenReserves, "Not enough tokens in reserve");
@@ -94,8 +124,27 @@ contract PumpPool is ReentrancyGuard, Ownable {
         ethReserves += msg.value;
         tokenReserves -= tokenAmount;
         
+        // Initialize vesting for user only if bought before selling is enabled
+        if (block.timestamp < sellingEnableTimestamp) {
+            // Only apply vesting during the initial phase
+            if (userVestingStart[msg.sender] == 0) {
+                userVestingStart[msg.sender] = block.timestamp;
+                userInitialBalance[msg.sender] = tokenAmount;
+                userTotalSold[msg.sender] = 0;
+                emit VestingInitialized(msg.sender, tokenAmount, block.timestamp);
+            } else {
+                // Update initial balance with new purchase
+                userInitialBalance[msg.sender] += tokenAmount;
+            }
+        }
+        
         // Transfer tokens to buyer
         IERC20(token).safeTransfer(msg.sender, tokenAmount);
+        
+        // Mark initial phase as completed after first buy
+        if (!initialPhaseCompleted) {
+            initialPhaseCompleted = true;
+        }
         
         emit Buy(msg.sender, tokenAmount, msg.value, fee);
         return tokenAmount;
@@ -115,6 +164,16 @@ contract PumpPool is ReentrancyGuard, Ownable {
         if (!sellingEnabled && block.timestamp >= sellingEnableTimestamp) {
             sellingEnabled = true;
             emit SellingEnabled();
+        }
+        
+        // Check vesting limits only if the user has a vesting schedule
+        // (which means they bought during the initial phase)
+        if (userVestingStart[msg.sender] > 0 && block.timestamp < userVestingStart[msg.sender] + VESTING_PERIOD) {
+            uint256 sellableAmount = getMaxSellableAmount(msg.sender);
+            require(tokenAmount <= sellableAmount, "Exceeds vesting allowance");
+            
+            // Update user's total sold amount for vesting tracking
+            userTotalSold[msg.sender] += tokenAmount;
         }
         
         // Calculate ETH amount using bonding curve
@@ -142,17 +201,77 @@ contract PumpPool is ReentrancyGuard, Ownable {
     }
     
     /**
+     * @dev Gets the maximum amount of tokens a user can sell based on vesting schedule
+     * @param user Address of the user
+     * @return amount Maximum amount of tokens that can be sold
+     */
+    function getMaxSellableAmount(address user) public view returns (uint256 amount) {
+        if (userVestingStart[user] == 0 || userInitialBalance[user] == 0) {
+            return 0;
+        }
+        
+        // Calculate time elapsed since vesting started
+        uint256 timeElapsed = block.timestamp - userVestingStart[user];
+        
+        // If vesting period is complete, allow selling all tokens
+        if (timeElapsed >= VESTING_PERIOD) {
+            return userInitialBalance[user] - userTotalSold[user];
+        }
+        
+        // Calculate days elapsed (truncated to whole days)
+        uint256 daysElapsed = (timeElapsed / 1 days) + 1; // +1 to allow selling on day 1
+        if (daysElapsed > 7) daysElapsed = 7; // Cap at 7 days
+        
+        // Calculate total sellable amount based on days elapsed (linear vesting)
+        uint256 totalAllowedToSell = (userInitialBalance[user] * DAILY_UNLOCK_PERCENTAGE * daysElapsed) / 10000;
+        
+        // Return the remaining amount that can be sold
+        if (totalAllowedToSell <= userTotalSold[user]) {
+            return 0;
+        }
+        
+        return totalAllowedToSell - userTotalSold[user];
+    }
+    
+    /**
+     * @dev Returns the vesting status for a user
+     * @param user Address of the user
+     * @return vestingStartTime The timestamp when vesting started
+     * @return initialBalance The initial token balance when vesting started
+     * @return totalSold The total amount sold so far
+     * @return maxSellableNow The maximum amount that can be sold now
+     * @return vestingEndsAt The timestamp when vesting period ends
+     * @return isVestingComplete Whether the vesting period is complete
+     */
+    function getUserVestingStatus(address user) external view returns (
+        uint256 vestingStartTime,
+        uint256 initialBalance,
+        uint256 totalSold,
+        uint256 maxSellableNow,
+        uint256 vestingEndsAt,
+        bool isVestingComplete
+    ) {
+        vestingStartTime = userVestingStart[user];
+        initialBalance = userInitialBalance[user];
+        totalSold = userTotalSold[user];
+        maxSellableNow = getMaxSellableAmount(user);
+        vestingEndsAt = vestingStartTime + VESTING_PERIOD;
+        isVestingComplete = block.timestamp >= vestingEndsAt;
+    }
+    
+    /**
      * @dev Calculates token amount to be received when buying with ETH
      * @param ethAmount Amount of ETH to spend
      * @return tokenAmount Amount of tokens to receive
      */
     function calculateBuyAmount(uint256 ethAmount) public view returns (uint256 tokenAmount) {
-        // Simple bonding curve: y = k * x / (x + c)
-        // where k is a constant and c is a parameter that controls the curve shape
-        uint256 k = tokenReserves;
-        uint256 c = ethReserves;
+        if (ethReserves == 0 || tokenReserves == 0) return 0;
         
-        return (k * ethAmount) / (c + ethAmount);
+        // Use AMM formula (Constant Product): x * y = k
+        // If we add dx to x, we get dy from y where (x + dx) * (y - dy) = x * y
+        
+        // AMM formula: tokenAmount = (tokenReserves * ethAmount) / (ethReserves + ethAmount)
+        return (tokenReserves * ethAmount) / (ethReserves + ethAmount);
     }
     
     /**
@@ -161,11 +280,13 @@ contract PumpPool is ReentrancyGuard, Ownable {
      * @return ethAmount Amount of ETH to receive
      */
     function calculateSellAmount(uint256 tokenAmount) public view returns (uint256 ethAmount) {
-        // Reverse of the bonding curve for buying
-        uint256 k = tokenReserves;
-        uint256 c = ethReserves;
+        if (ethReserves == 0 || tokenReserves == 0) return 0;
         
-        return (c * tokenAmount) / (k + tokenAmount);
+        // Use AMM formula (Constant Product): x * y = k
+        // If we add dx to y, we get dy from x where (x - dy) * (y + dx) = x * y
+        
+        // AMM formula: ethAmount = (ethReserves * tokenAmount) / (tokenReserves + tokenAmount)
+        return (ethReserves * tokenAmount) / (tokenReserves + tokenAmount);
     }
     
     /**
